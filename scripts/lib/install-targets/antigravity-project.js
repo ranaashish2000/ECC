@@ -1,3 +1,4 @@
+const fs = require('fs');
 const path = require('path');
 
 const {
@@ -7,8 +8,21 @@ const {
   createManagedScaffoldOperation,
   normalizeRelativePath,
 } = require('./helpers');
+const { buildAntigravityHooksConfig } = require('../antigravity-hooks');
+const { buildAntigravityMcpConfig } = require('../antigravity-mcp');
+const { buildAntigravityPluginManifest } = require('../antigravity-plugin');
 
-const SUPPORTED_SOURCE_PREFIXES = ['rules', 'commands', 'agents', 'skills'];
+const SUPPORTED_SOURCE_PREFIXES = [
+  'rules',
+  'commands',
+  'agents',
+  'skills',
+  'hooks',
+  'scripts/hooks',
+  'scripts/lib',
+  'mcp-configs',
+  '.mcp.json',
+];
 
 function supportsAntigravitySourcePath(sourceRelativePath) {
   const normalizedPath = normalizeRelativePath(sourceRelativePath);
@@ -17,12 +31,28 @@ function supportsAntigravitySourcePath(sourceRelativePath) {
   ));
 }
 
+function readJsonObject(filePath, label) {
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (error) {
+    throw new Error(`Failed to parse ${label} at ${filePath}: ${error.message}`);
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`Invalid ${label} at ${filePath}: expected a JSON object`);
+  }
+
+  return parsed;
+}
+
 module.exports = createInstallTargetAdapter({
   id: 'antigravity-project',
   target: 'antigravity',
   kind: 'project',
   rootSegments: ['.agents'],
   installStatePathSegments: ['ecc-install-state.json'],
+  nativeRootRelativePath: '.agents',
   supportsModule(module) {
     const paths = Array.isArray(module && module.paths) ? module.paths : [];
     return paths.length > 0;
@@ -112,6 +142,82 @@ module.exports = createInstallTargetAdapter({
                 'preserve-relative-path'
               ),
             ];
+          }
+
+          if (
+            module.id === 'hooks-runtime'
+            && normalizedSourcePath === 'hooks'
+          ) {
+            return [
+              createManagedOperation({
+                kind: 'merge-json',
+                moduleId: module.id,
+                sourceRelativePath: 'hooks/hooks.json',
+                destinationPath: path.join(targetRoot, 'hooks.json'),
+                strategy: 'merge-json',
+                ownership: 'managed',
+                scaffoldOnly: false,
+                mergePayload: buildAntigravityHooksConfig({
+                  profile: input.hookProfile || 'standard',
+                }),
+              }),
+            ];
+          }
+
+          if (
+            module.id === 'platform-configs'
+            && (normalizedSourcePath === 'mcp-configs' || normalizedSourcePath === '.mcp.json')
+          ) {
+            const baseMcp = (repoRoot && fs.existsSync(path.join(repoRoot, '.mcp.json')))
+              ? readJsonObject(path.join(repoRoot, '.mcp.json'), '.mcp.json')
+              : { mcpServers: {} };
+            const antigravityMcp = buildAntigravityMcpConfig();
+            const mergedMcp = {
+              mcpServers: {
+                ...(baseMcp.mcpServers || {}),
+                ...(antigravityMcp.mcpServers || {}),
+              },
+            };
+
+            const operations = [
+              createManagedOperation({
+                kind: 'merge-json',
+                moduleId: module.id,
+                sourceRelativePath: '.mcp.json',
+                destinationPath: path.join(targetRoot, 'mcp_config.json'),
+                strategy: 'merge-json',
+                ownership: 'managed',
+                scaffoldOnly: false,
+                mergePayload: mergedMcp,
+              }),
+              createManagedOperation({
+                kind: 'merge-json',
+                moduleId: module.id,
+                sourceRelativePath: 'plugin.json',
+                destinationPath: path.join(targetRoot, 'plugins', 'ecc', 'plugin.json'),
+                strategy: 'merge-json',
+                ownership: 'managed',
+                scaffoldOnly: false,
+                mergePayload: buildAntigravityPluginManifest(),
+              }),
+            ];
+
+            if (repoRoot && fs.existsSync(path.join(repoRoot, 'scripts', 'memory-mcp.mjs'))) {
+              operations.push(
+                createManagedScaffoldOperation(
+                  module.id,
+                  'scripts/memory-mcp.mjs',
+                  path.join(targetRoot, 'scripts', 'memory-mcp.mjs'),
+                  'preserve-relative-path'
+                )
+              );
+            }
+
+            return operations;
+          }
+
+          if (normalizedSourcePath === 'scripts/hooks' || normalizedSourcePath === 'scripts/lib') {
+            return [adapter.createScaffoldOperation(module.id, normalizedSourcePath, planningInput)];
           }
 
           return [];
